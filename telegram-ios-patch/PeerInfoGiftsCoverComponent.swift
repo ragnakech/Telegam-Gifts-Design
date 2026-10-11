@@ -13,6 +13,7 @@ import EmojiTextAttachmentView
 import LokiRng
 import TextFormat
 import HierarchyTrackingLayer
+import AVFoundation
 
 public final class PeerInfoGiftsCoverComponent: Component {
     public let context: AccountContext
@@ -132,6 +133,8 @@ public final class PeerInfoGiftsCoverComponent: Component {
 
         private let blackHoleLayer = BlackHoleLayer()
         private var dustLayers: [AnyHashable: GiftDustLayer] = [:]
+        private let gloveLayer = GiftSnapGloveLayer()
+        private var snapTriggered = false
 
         private var isUpdating = false
 
@@ -313,6 +316,7 @@ public final class PeerInfoGiftsCoverComponent: Component {
             }
                                                                           
             var validIds = Set<AnyHashable>()
+            var placedGifts: [(point: CGPoint, radius: CGFloat)] = []
             var index = 0
             for gift in self.gifts.prefix(12) {
                 guard index < self.iconPositions.count else {
@@ -426,6 +430,23 @@ public final class PeerInfoGiftsCoverComponent: Component {
                     }
                 }
 
+                // Soft-body spacing: a gift never sits on top of an earlier one, it is pushed out along the contact line.
+                // This is stateless (derived from the layout every pass), so it never jitters.
+                let giftRadius = iconSize.width * 0.5 * resultScale * 1.15
+                for other in placedGifts {
+                    let ddx = absolutePosition.x - other.point.x
+                    let ddy = absolutePosition.y - other.point.y
+                    let distance = max(0.001, sqrt(ddx * ddx + ddy * ddy))
+                    let minDistance = giftRadius + other.radius + 4.0
+                    if distance < minDistance {
+                        let push = minDistance - distance
+                        absolutePosition = CGPoint(x: absolutePosition.x + ddx / distance * push, y: absolutePosition.y + ddy / distance * push)
+                    }
+                }
+                if resultAlpha > 0.05 {
+                    placedGifts.append((absolutePosition, giftRadius))
+                }
+
                 iconTransition.setBounds(layer: iconLayer, bounds: CGRect(origin: .zero, size: iconSize))
                 iconTransition.setPosition(layer: iconLayer, position: absolutePosition)
                 iconLayer.updateRotation(resultAngle, transition: iconTransition)
@@ -436,6 +457,25 @@ public final class PeerInfoGiftsCoverComponent: Component {
                 }
                 
                 index += 1
+            }
+
+            // Snap glove (disintegrate style only): appears next to the avatar and snaps once when gifts start to hide.
+            let hideFraction = min(1.0, component.avatarTransitionFraction * 1.33)
+            if component.hideStyle == .disintegrate, component.islandCenter != nil, !self.gifts.isEmpty {
+                self.gloveLayer.position = CGPoint(x: component.avatarCenter.x + component.avatarSize.width * 0.5 + 58.0, y: component.avatarCenter.y + 10.0)
+                if hideFraction > 0.02 && !self.snapTriggered {
+                    self.snapTriggered = true
+                    if self.gloveLayer.superlayer == nil {
+                        self.layer.addSublayer(self.gloveLayer)
+                    }
+                    self.gloveLayer.snap()
+                } else if hideFraction <= 0.001 && self.snapTriggered {
+                    self.snapTriggered = false
+                    self.gloveLayer.hide()
+                }
+            } else if self.snapTriggered {
+                self.snapTriggered = false
+                self.gloveLayer.removeFromSuperlayer()
             }
 
             if component.hideStyle != .disintegrate, !self.dustLayers.isEmpty {
@@ -587,6 +627,148 @@ private final class GiftDustLayer: SimpleLayer {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             self?.emitterLayer.birthRate = 0.0
         }
+    }
+}
+
+// Small procedural sound for the snap: a low thump plus a short noise burst, generated in memory (no audio asset).
+private let giftSnapSoundPlayer: AVAudioPlayer? = {
+    let sampleRate = 22050.0
+    let count = Int(sampleRate * 0.28)
+    var pcm = [Int16](repeating: 0, count: count)
+    var seed: UInt32 = 12345
+    for i in 0 ..< count {
+        let t = Double(i) / sampleRate
+        seed = seed &* 1664525 &+ 1013904223
+        let noise = Double(Int32(bitPattern: seed)) / Double(Int32.max)
+        let click = noise * exp(-t * 70.0) * 0.8
+        let thump = sin(2.0 * Double.pi * (150.0 - 90.0 * t) * t) * exp(-t * 16.0) * 0.7
+        pcm[i] = Int16(max(-1.0, min(1.0, click + thump)) * 30000.0)
+    }
+    var data = Data()
+    func append32(_ v: UInt32) { var x = v.littleEndian; data.append(Data(bytes: &x, count: 4)) }
+    func append16(_ v: UInt16) { var x = v.littleEndian; data.append(Data(bytes: &x, count: 2)) }
+    data.append("RIFF".data(using: .ascii)!); append32(UInt32(36 + count * 2)); data.append("WAVE".data(using: .ascii)!)
+    data.append("fmt ".data(using: .ascii)!); append32(16); append16(1); append16(1); append32(UInt32(sampleRate)); append32(UInt32(sampleRate) * 2); append16(2); append16(16)
+    data.append("data".data(using: .ascii)!); append32(UInt32(count * 2))
+    pcm.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
+    let player = try? AVAudioPlayer(data: data)
+    player?.prepareToPlay()
+    return player
+}()
+
+// Simplified silver glove drawn with shape layers: palm, three fingers, and a thumb + index that pinch and snap.
+private final class GiftSnapGloveLayer: SimpleLayer {
+    private let palm = CAShapeLayer()
+    private let fingers: [CAShapeLayer]
+    private let thumb = CAShapeLayer()
+    private let index = CAShapeLayer()
+    private let flash = SimpleLayer()
+
+    override init() {
+        func finger(_ rect: CGRect) -> CAShapeLayer {
+            let l = CAShapeLayer()
+            l.path = UIBezierPath(roundedRect: rect, cornerRadius: rect.width / 2.0).cgPath
+            l.fillColor = UIColor(rgb: 0xcfd3dc).cgColor
+            l.strokeColor = UIColor(rgb: 0x8b93a3).cgColor
+            l.lineWidth = 1.0
+            return l
+        }
+        self.fingers = [
+            finger(CGRect(x: 30.0, y: 0.0, width: 11.0, height: 36.0)),
+            finger(CGRect(x: 43.0, y: 4.0, width: 11.0, height: 33.0)),
+            finger(CGRect(x: 56.0, y: 10.0, width: 10.0, height: 28.0))
+        ]
+        super.init()
+
+        self.bounds = CGRect(x: 0.0, y: 0.0, width: 80.0, height: 100.0)
+        self.opacity = 0.0
+
+        self.palm.path = UIBezierPath(roundedRect: CGRect(x: 24.0, y: 32.0, width: 44.0, height: 44.0), cornerRadius: 14.0).cgPath
+        self.palm.fillColor = UIColor(rgb: 0xdfe3ea).cgColor
+        self.palm.strokeColor = UIColor(rgb: 0x8b93a3).cgColor
+        self.palm.lineWidth = 1.0
+        self.addSublayer(self.palm)
+        for f in self.fingers { self.addSublayer(f) }
+
+        // Index finger and thumb pivot at their bases so they can bend toward each other.
+        self.index.path = UIBezierPath(roundedRect: CGRect(x: 0.0, y: 0.0, width: 11.0, height: 34.0), cornerRadius: 5.5).cgPath
+        self.index.fillColor = UIColor(rgb: 0xcfd3dc).cgColor
+        self.index.strokeColor = UIColor(rgb: 0x8b93a3).cgColor
+        self.index.lineWidth = 1.0
+        self.index.bounds = CGRect(x: 0.0, y: 0.0, width: 11.0, height: 34.0)
+        self.index.anchorPoint = CGPoint(x: 0.5, y: 1.0)
+        self.index.position = CGPoint(x: 35.0, y: 40.0)
+        self.addSublayer(self.index)
+
+        self.thumb.path = UIBezierPath(roundedRect: CGRect(x: 0.0, y: 0.0, width: 12.0, height: 30.0), cornerRadius: 6.0).cgPath
+        self.thumb.fillColor = UIColor(rgb: 0xcfd3dc).cgColor
+        self.thumb.strokeColor = UIColor(rgb: 0x8b93a3).cgColor
+        self.thumb.lineWidth = 1.0
+        self.thumb.bounds = CGRect(x: 0.0, y: 0.0, width: 12.0, height: 30.0)
+        self.thumb.anchorPoint = CGPoint(x: 0.5, y: 1.0)
+        self.thumb.position = CGPoint(x: 26.0, y: 70.0)
+        self.thumb.transform = CATransform3DMakeRotation(-.pi * 0.45, 0.0, 0.0, 1.0)
+        self.addSublayer(self.thumb)
+
+        self.flash.bounds = CGRect(x: 0.0, y: 0.0, width: 28.0, height: 28.0)
+        self.flash.position = CGPoint(x: 30.0, y: 36.0)
+        self.flash.cornerRadius = 14.0
+        self.flash.backgroundColor = UIColor.white.cgColor
+        self.flash.opacity = 0.0
+        self.addSublayer(self.flash)
+    }
+
+    override init(layer: Any) {
+        self.fingers = []
+        super.init(layer: layer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func snap() {
+        self.removeAllAnimations()
+        self.opacity = 1.0
+        self.animateScale(from: 0.6, to: 1.0, duration: 0.25)
+        self.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+
+        // Pinch: thumb swings in and the index bends toward it, then both release.
+        let pinch = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        pinch.values = [-CGFloat.pi * 0.45, -CGFloat.pi * 0.08, -CGFloat.pi * 0.08, -CGFloat.pi * 0.5]
+        pinch.keyTimes = [0.0, 0.42, 0.55, 1.0]
+        pinch.duration = 0.5
+        pinch.beginTime = CACurrentMediaTime() + 0.2
+        pinch.fillMode = .backwards
+        self.thumb.add(pinch, forKey: "pinch")
+
+        let bend = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+        bend.values = [0.0, -CGFloat.pi * 0.4, -CGFloat.pi * 0.4, 0.05]
+        bend.keyTimes = [0.0, 0.42, 0.55, 1.0]
+        bend.duration = 0.5
+        bend.beginTime = CACurrentMediaTime() + 0.2
+        bend.fillMode = .backwards
+        self.index.add(bend, forKey: "bend")
+
+        let flashAnimation = CAKeyframeAnimation(keyPath: "opacity")
+        flashAnimation.values = [0.0, 0.0, 0.95, 0.0]
+        flashAnimation.keyTimes = [0.0, 0.5, 0.58, 1.0]
+        flashAnimation.duration = 0.7
+        flashAnimation.beginTime = CACurrentMediaTime() + 0.2
+        self.flash.add(flashAnimation, forKey: "flash")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2 + 0.5 * 0.5) {
+            giftSnapSoundPlayer?.currentTime = 0.0
+            giftSnapSoundPlayer?.play()
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        }
+    }
+
+    func hide() {
+        self.animateAlpha(from: 1.0, to: 0.0, duration: 0.25, removeOnCompletion: false, completion: { [weak self] _ in
+            self?.opacity = 0.0
+            self?.removeFromSuperlayer()
+        })
     }
 }
 
