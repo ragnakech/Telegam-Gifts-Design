@@ -1,0 +1,369 @@
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoCoverComponent/Sources/PeerInfoGiftsCoverComponent.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoCoverComponent/Sources/PeerInfoGiftsCoverComponent.swift
+index 02aa6d2..6fbc5e2 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoCoverComponent/Sources/PeerInfoGiftsCoverComponent.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoCoverComponent/Sources/PeerInfoGiftsCoverComponent.swift
+@@ -28,8 +28,10 @@ public final class PeerInfoGiftsCoverComponent: Component {
+     public let topRightButtonsSize: CGSize
+     public let titleWidth: CGFloat
+     public let bottomHeight: CGFloat
++    public let islandCenter: CGPoint?
++    public let hideStyle: GiftHideStyle
+     public let action: (ProfileGiftsContext.State.StarGift) -> Void
+-    
++
+     public init(
+         context: AccountContext,
+         peerId: EnginePeer.Id,
+@@ -44,6 +46,8 @@ public final class PeerInfoGiftsCoverComponent: Component {
+         topRightButtonsSize: CGSize,
+         titleWidth: CGFloat,
+         bottomHeight: CGFloat,
++        islandCenter: CGPoint? = nil,
++        hideStyle: GiftHideStyle = GiftHideStyle.current,
+         action: @escaping (ProfileGiftsContext.State.StarGift) -> Void
+     ) {
+         self.context = context
+@@ -59,6 +63,8 @@ public final class PeerInfoGiftsCoverComponent: Component {
+         self.topRightButtonsSize = topRightButtonsSize
+         self.titleWidth = titleWidth
+         self.bottomHeight = bottomHeight
++        self.islandCenter = islandCenter
++        self.hideStyle = hideStyle
+         self.action = action
+     }
+     
+@@ -99,6 +105,12 @@ public final class PeerInfoGiftsCoverComponent: Component {
+         if lhs.bottomHeight != rhs.bottomHeight {
+             return false
+         }
++        if lhs.islandCenter != rhs.islandCenter {
++            return false
++        }
++        if lhs.hideStyle != rhs.hideStyle {
++            return false
++        }
+         return true
+     }
+     
+@@ -117,15 +129,19 @@ public final class PeerInfoGiftsCoverComponent: Component {
+         
+         private let trackingLayer = HierarchyTrackingLayer()
+         private var isCurrentlyInHierarchy = false
+-        
++
++        private let blackHoleLayer = BlackHoleLayer()
++        private var dustLayers: [AnyHashable: GiftDustLayer] = [:]
++
+         private var isUpdating = false
+-        
++
+         override public init(frame: CGRect) {
+             super.init(frame: frame)
+-            
++
+             self.clipsToBounds = true
+-            
++
+             self.layer.addSublayer(self.trackingLayer)
++            self.layer.addSublayer(self.blackHoleLayer)
+             
+             self.trackingLayer.didEnterHierarchy = { [weak self] in
+                 guard let self else {
+@@ -202,7 +218,7 @@ public final class PeerInfoGiftsCoverComponent: Component {
+             for (_, layer) in self.iconLayers {
+                 layer.opacity = 1.0
+                 layer.animatePosition(
+-                    from: component.avatarCenter,
++                    from: component.islandCenter ?? component.avatarCenter,
+                     to: layer.position,
+                     duration: 0.4,
+                     timingFunction: kCAMediaTimingFunctionSpring
+@@ -349,20 +365,93 @@ public final class PeerInfoGiftsCoverComponent: Component {
+                 let effectivePosition = interpolatePosition(from: iconPosition, to: centerPosition, t: itemScaleFraction)
+                 let effectiveAngle = toAngle * itemScaleFraction
+                 
+-                let absolutePosition = getAbsolutePosition(position: effectivePosition, centerPoint: component.avatarCenter)
+-                                
++                var absolutePosition = getAbsolutePosition(position: effectivePosition, centerPoint: component.avatarCenter)
++                var resultAngle = effectiveAngle
++                var resultScale = iconPosition.scale * (1.0 - itemScaleFraction)
++                var resultAlpha = 1.0 - itemScaleFraction
++
++                if let islandCenter = component.islandCenter {
++                    let homePoint = getAbsolutePosition(position: iconPosition, centerPoint: component.avatarCenter)
++                    let dx = homePoint.x - islandCenter.x
++                    let dy = homePoint.y - islandCenter.y
++                    let startDistance = sqrt(dx * dx + dy * dy)
++                    let startAngle = atan2(dy, dx)
++                    let fraction = itemScaleFraction
++                    let pull = fraction * fraction * fraction
++
++                    switch component.hideStyle {
++                    case .blackHole:
++                        // Spiral into the island while spinning: slow start, fast finish.
++                        let spin: CGFloat = .pi * 1.9
++                        let spiralAngle = startAngle + spin * pow(fraction, 1.8)
++                        let spiralDistance = startDistance * (1.0 - pull)
++                        absolutePosition = CGPoint(
++                            x: islandCenter.x + spiralDistance * cos(spiralAngle),
++                            y: islandCenter.y + spiralDistance * sin(spiralAngle)
++                        )
++                        resultAngle = spin * fraction * 0.35
++                        resultScale = iconPosition.scale * (1.0 - 0.82 * pull)
++                        resultAlpha = fraction > 0.88 ? max(0.0, (1.0 - fraction) / 0.12) : 1.0
++                    case .straight:
++                        // Straight line into the island, no spin.
++                        let distance = startDistance * (1.0 - pull)
++                        absolutePosition = CGPoint(
++                            x: islandCenter.x + distance * cos(startAngle),
++                            y: islandCenter.y + distance * sin(startAngle)
++                        )
++                        resultAngle = 0.0
++                        resultScale = iconPosition.scale * (1.0 - 0.82 * pull)
++                        resultAlpha = fraction > 0.88 ? max(0.0, (1.0 - fraction) / 0.12) : 1.0
++                    case .disintegrate:
++                        // Gifts stay in place, drift slightly and fade out while dust flies away.
++                        absolutePosition = CGPoint(x: homePoint.x + 14.0 * fraction, y: homePoint.y - 10.0 * fraction)
++                        resultAngle = 0.0
++                        resultScale = iconPosition.scale * (1.0 - 0.15 * fraction)
++                        resultAlpha = max(0.0, 1.0 - 3.2 * fraction)
++
++                        if fraction > 0.02 {
++                            let dust: GiftDustLayer
++                            if let current = self.dustLayers[id] {
++                                dust = current
++                            } else {
++                                dust = GiftDustLayer()
++                                self.dustLayers[id] = dust
++                                self.layer.addSublayer(dust)
++                                dust.burst()
++                            }
++                            dust.position = absolutePosition
++                        } else if let dust = self.dustLayers.removeValue(forKey: id) {
++                            dust.removeFromSuperlayer()
++                        }
++                    }
++                }
++
+                 iconTransition.setBounds(layer: iconLayer, bounds: CGRect(origin: .zero, size: iconSize))
+                 iconTransition.setPosition(layer: iconLayer, position: absolutePosition)
+-                iconLayer.updateRotation(effectiveAngle, transition: iconTransition)
+-                iconTransition.setScale(layer: iconLayer, scale: iconPosition.scale * (1.0 - itemScaleFraction))
+-                
++                iconLayer.updateRotation(resultAngle, transition: iconTransition)
++                iconTransition.setScale(layer: iconLayer, scale: resultScale)
++
+                 if !self.scheduledAnimateIn {
+-                    iconTransition.setAlpha(layer: iconLayer, alpha: 1.0 - itemScaleFraction)
++                    iconTransition.setAlpha(layer: iconLayer, alpha: resultAlpha)
+                 }
+                 
+                 index += 1
+             }
+-            
++
++            if component.hideStyle != .disintegrate, !self.dustLayers.isEmpty {
++                for (_, dust) in self.dustLayers {
++                    dust.removeFromSuperlayer()
++                }
++                self.dustLayers.removeAll()
++            }
++
++            if let islandCenter = component.islandCenter, !self.gifts.isEmpty, component.hideStyle != .disintegrate {
++                let intensity: CGFloat = component.hideStyle == .blackHole ? 1.0 : 0.45
++                self.blackHoleLayer.update(center: islandCenter, fraction: min(1.0, component.avatarTransitionFraction * 1.33) * intensity, transition: transition)
++            } else {
++                self.blackHoleLayer.update(center: component.islandCenter ?? .zero, fraction: 0.0, transition: transition)
++            }
++
+             var removeIds: [AnyHashable] = []
+             for (id, layer) in self.iconLayers {
+                 if !validIds.contains(id) {
+@@ -401,6 +490,174 @@ private var shadowImage: UIImage? = {
+     })
+ }()
+ 
++private let blackHoleGlowImage: UIImage? = {
++    return generateImage(CGSize(width: 250.0, height: 250.0), rotatedContext: { size, context in
++        context.clear(CGRect(origin: .zero, size: size))
++
++        var locations: [CGFloat] = [0.0, 0.35, 1.0]
++        let colors: [CGColor] = [UIColor(rgb: 0xff964f, alpha: 0.42).cgColor, UIColor(rgb: 0xff4fa0, alpha: 0.16).cgColor, UIColor(rgb: 0xff4fa0, alpha: 0.0).cgColor]
++        let colorSpace = CGColorSpaceCreateDeviceRGB()
++        let gradient = CGGradient(colorsSpace: colorSpace, colors: colors as CFArray, locations: &locations)!
++        let center = CGPoint(x: size.width / 2.0, y: size.height / 2.0)
++        context.drawRadialGradient(gradient, startCenter: center, startRadius: 0.0, endCenter: center, endRadius: size.width / 2.0, options: .drawsAfterEndLocation)
++    })
++}()
++
++private let blackHoleRingMaskImage: UIImage? = {
++    return generateImage(CGSize(width: 250.0, height: 250.0), rotatedContext: { size, context in
++        context.clear(CGRect(origin: .zero, size: size))
++
++        var locations: [CGFloat] = [0.0, 0.40, 0.54, 0.62, 1.0]
++        let colors: [CGColor] = [UIColor(rgb: 0xffffff, alpha: 0.0).cgColor, UIColor(rgb: 0xffffff, alpha: 0.0).cgColor, UIColor(rgb: 0xffffff, alpha: 1.0).cgColor, UIColor(rgb: 0xffffff, alpha: 1.0).cgColor, UIColor(rgb: 0xffffff, alpha: 0.0).cgColor]
++        let colorSpace = CGColorSpaceCreateDeviceRGB()
++        let gradient = CGGradient(colorsSpace: colorSpace, colors: colors as CFArray, locations: &locations)!
++        let center = CGPoint(x: size.width / 2.0, y: size.height / 2.0)
++        context.drawRadialGradient(gradient, startCenter: center, startRadius: 0.0, endCenter: center, endRadius: size.width / 2.0, options: .drawsAfterEndLocation)
++    })
++}()
++
++public enum GiftHideStyle: Int {
++    case blackHole = 0
++    case straight = 1
++    case disintegrate = 2
++
++    private static let defaultsKey = "bhGiftHideStyle"
++
++    public static var current: GiftHideStyle {
++        get {
++            return GiftHideStyle(rawValue: UserDefaults.standard.integer(forKey: GiftHideStyle.defaultsKey)) ?? .blackHole
++        }
++        set {
++            UserDefaults.standard.set(newValue.rawValue, forKey: GiftHideStyle.defaultsKey)
++        }
++    }
++}
++
++private let giftDustImage: UIImage? = {
++    return generateImage(CGSize(width: 6.0, height: 6.0), rotatedContext: { size, context in
++        context.clear(CGRect(origin: .zero, size: size))
++        context.setFillColor(UIColor.white.cgColor)
++        context.fillEllipse(in: CGRect(origin: .zero, size: size))
++    })
++}()
++
++// One-shot burst of dust particles used by the "disintegrate" hide style.
++private final class GiftDustLayer: SimpleLayer {
++    private let emitterLayer = CAEmitterLayer()
++
++    override init() {
++        super.init()
++
++        self.emitterLayer.emitterShape = .rectangle
++        self.emitterLayer.emitterSize = CGSize(width: 30.0, height: 30.0)
++        self.emitterLayer.renderMode = .additive
++        self.emitterLayer.birthRate = 0.0
++
++        let cell = CAEmitterCell()
++        cell.contents = giftDustImage?.cgImage
++        cell.birthRate = 90.0
++        cell.lifetime = 1.1
++        cell.lifetimeRange = 0.4
++        cell.velocity = 55.0
++        cell.velocityRange = 35.0
++        cell.emissionLongitude = -.pi / 4.0
++        cell.emissionRange = .pi / 2.0
++        cell.yAcceleration = -25.0
++        cell.scale = 0.5
++        cell.scaleRange = 0.35
++        cell.scaleSpeed = -0.35
++        cell.alphaSpeed = -0.9
++        cell.color = UIColor(rgb: 0xd9dde6).cgColor
++        self.emitterLayer.emitterCells = [cell]
++
++        self.addSublayer(self.emitterLayer)
++    }
++
++    override init(layer: Any) {
++        super.init(layer: layer)
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    func burst() {
++        self.emitterLayer.beginTime = CACurrentMediaTime()
++        self.emitterLayer.birthRate = 1.0
++        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
++            self?.emitterLayer.birthRate = 0.0
++        }
++    }
++}
++
++private final class BlackHoleLayer: SimpleLayer {
++    private let diameter: CGFloat = 250.0
++    private let glowLayer = SimpleLayer()
++    private let ringLayer = CAGradientLayer()
++    private let ringMaskLayer = SimpleLayer()
++
++    override init() {
++        super.init()
++
++        self.opacity = 0.0
++
++        self.glowLayer.contents = blackHoleGlowImage?.cgImage
++
++        self.ringLayer.type = .conic
++        self.ringLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
++        self.ringLayer.endPoint = CGPoint(x: 0.5, y: 0.0)
++        self.ringLayer.colors = [
++            UIColor(rgb: 0xffb86b, alpha: 0.0).cgColor,
++            UIColor(rgb: 0xffb86b, alpha: 1.0).cgColor,
++            UIColor(rgb: 0xff4fa0, alpha: 1.0).cgColor,
++            UIColor(rgb: 0x5b8cff, alpha: 0.0).cgColor,
++            UIColor(rgb: 0x5b8cff, alpha: 1.0).cgColor,
++            UIColor(rgb: 0x7be0ff, alpha: 1.0).cgColor,
++            UIColor(rgb: 0xffb86b, alpha: 0.0).cgColor
++        ]
++        self.ringLayer.locations = [0.0, 0.14, 0.33, 0.47, 0.64, 0.80, 1.0]
++        self.ringMaskLayer.contents = blackHoleRingMaskImage?.cgImage
++        self.ringLayer.mask = self.ringMaskLayer
++
++        self.addSublayer(self.glowLayer)
++        self.addSublayer(self.ringLayer)
++    }
++
++    override init(layer: Any) {
++        super.init(layer: layer)
++    }
++
++    required init?(coder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    func update(center: CGPoint, fraction: CGFloat, transition: ComponentTransition) {
++        let fraction = max(0.0, min(1.0, fraction))
++
++        let bounds = CGRect(origin: .zero, size: CGSize(width: self.diameter, height: self.diameter))
++        self.bounds = bounds
++        self.position = center
++        self.glowLayer.frame = bounds
++        self.ringLayer.frame = bounds
++        self.ringMaskLayer.frame = bounds
++
++        // The disc is squashed vertically so it reads as an accretion disc seen at an angle.
++        let scale = 0.6 + 0.5 * fraction
++        self.transform = CATransform3DMakeScale(scale, scale * 0.42, 1.0)
++        transition.setAlpha(layer: self, alpha: fraction)
++
++        if self.ringLayer.animation(forKey: "spin") == nil {
++            let animation = CABasicAnimation(keyPath: "transform.rotation.z")
++            animation.fromValue = 0.0
++            animation.toValue = CGFloat.pi * 2.0
++            animation.duration = 4.0
++            animation.repeatCount = .infinity
++            animation.isRemovedOnCompletion = false
++            self.ringLayer.add(animation, forKey: "spin")
++        }
++    }
++}
++
+ private final class StarsEffectLayer: SimpleLayer {
+     private let emitterLayer = CAEmitterLayer()
+     
+diff --git a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift
+index ce0c801..5407772 100644
+--- a/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift
++++ b/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoHeaderNode.swift
+@@ -2549,6 +2549,8 @@ final class PeerInfoHeaderNode: ASDisplayNode {
+                     topRightButtonsSize: CGSize(width: 76.0 + (self.isMyProfile ? 38.0 : 0.0), height: 46.0),
+                     titleWidth: max(140.0, titleFrame.width) + 42.0,
+                     bottomHeight: !buttonKeys.isEmpty ? 81.0 : 30.0,
++                    // Approximate island center (126x37 pill, 11pt from the top). Verify per device model.
++                    islandCenter: deviceMetrics.hasDynamicIsland && statusBarHeight > 0.0 && !isLandscape && self.forumTopicThreadId == nil ? CGPoint(x: width / 2.0, y: 29.5) : nil,
+                     action: { [weak self] gift in
+                         guard let self, case let .unique(gift) = gift.gift else {
+                             return
