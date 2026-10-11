@@ -136,6 +136,13 @@ public final class PeerInfoGiftsCoverComponent: Component {
         private let gloveLayer = GiftSnapGloveLayer()
         private var snapTriggered = false
 
+        // Swipe-to-spin: horizontal drag rotates the gifts around the avatar, with inertia.
+        private var spinAngle: CGFloat = 0.0
+        private var spinVelocity: CGFloat = 0.0
+        private var spinDisplayLink: CADisplayLink?
+        private var spinLastTimestamp: CFTimeInterval = 0.0
+        private let styleLabel = UILabel()
+
         private var isUpdating = false
 
         override public init(frame: CGRect) {
@@ -162,6 +169,21 @@ public final class PeerInfoGiftsCoverComponent: Component {
             }
             
             self.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(self.tapped(_:))))
+
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(self.spinPanned(_:)))
+            self.addGestureRecognizer(pan)
+
+            // Long press cycles the hide style (stand-in for a Settings screen): black hole -> straight -> disintegrate.
+            self.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(self.longPressed(_:))))
+
+            self.styleLabel.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+            self.styleLabel.textColor = .white
+            self.styleLabel.textAlignment = .center
+            self.styleLabel.backgroundColor = UIColor(white: 0.0, alpha: 0.45)
+            self.styleLabel.layer.cornerRadius = 12.0
+            self.styleLabel.clipsToBounds = true
+            self.styleLabel.alpha = 0.0
+            self.addSubview(self.styleLabel)
         }
         
         required public init?(coder aDecoder: NSCoder) {
@@ -172,6 +194,87 @@ public final class PeerInfoGiftsCoverComponent: Component {
             self.giftsDisposable?.dispose()
         }
         
+        public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            if let pan = gestureRecognizer as? UIPanGestureRecognizer {
+                // Only a mostly-horizontal drag on the gifts, and never while the header is collapsing, so profile scrolling is untouched.
+                guard let component = self.component, component.avatarTransitionFraction < 0.01 else {
+                    return false
+                }
+                let velocity = pan.velocity(in: self)
+                let location = pan.location(in: self)
+                var onGift = false
+                for (_, iconLayer) in self.iconLayers where iconLayer.frame.insetBy(dx: -24.0, dy: -24.0).contains(location) {
+                    onGift = true
+                }
+                return onGift && abs(velocity.x) > abs(velocity.y) * 1.2
+            }
+            return true
+        }
+
+        @objc private func spinPanned(_ gestureRecognizer: UIPanGestureRecognizer) {
+            switch gestureRecognizer.state {
+            case .began:
+                self.stopSpinInertia()
+                self.spinVelocity = 0.0
+            case .changed:
+                let delta = gestureRecognizer.translation(in: self).x / 110.0
+                gestureRecognizer.setTranslation(.zero, in: self)
+                self.spinAngle += delta
+                self.spinVelocity = delta * 60.0
+                self.state?.updated(transition: .immediate)
+            case .ended, .cancelled:
+                self.spinVelocity = gestureRecognizer.velocity(in: self).x / 110.0
+                if abs(self.spinVelocity) > 0.05 {
+                    let link = CADisplayLink(target: self, selector: #selector(self.spinTick(_:)))
+                    self.spinLastTimestamp = 0.0
+                    link.add(to: .main, forMode: .common)
+                    self.spinDisplayLink = link
+                }
+            default:
+                break
+            }
+        }
+
+        @objc private func spinTick(_ link: CADisplayLink) {
+            let dt = self.spinLastTimestamp == 0.0 ? 1.0 / 60.0 : min(0.05, link.timestamp - self.spinLastTimestamp)
+            self.spinLastTimestamp = link.timestamp
+            self.spinAngle += self.spinVelocity * CGFloat(dt)
+            self.spinVelocity *= CGFloat(exp(-dt * 1.5))
+            self.state?.updated(transition: .immediate)
+            if abs(self.spinVelocity) < 0.01 {
+                self.stopSpinInertia()
+            }
+        }
+
+        private func stopSpinInertia() {
+            self.spinDisplayLink?.invalidate()
+            self.spinDisplayLink = nil
+        }
+
+        @objc private func longPressed(_ gestureRecognizer: UILongPressGestureRecognizer) {
+            guard gestureRecognizer.state == .began, let component = self.component else {
+                return
+            }
+            let next = GiftHideStyle(rawValue: (GiftHideStyle.current.rawValue + 1) % 3) ?? .blackHole
+            GiftHideStyle.current = next
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+
+            let title: String
+            switch next {
+            case .blackHole: title = "Black hole"
+            case .straight: title = "Fly"
+            case .disintegrate: title = "Disintegrate"
+            }
+            self.styleLabel.text = title
+            self.styleLabel.frame = CGRect(x: component.avatarCenter.x - 60.0, y: component.avatarCenter.y + component.avatarSize.height * 0.5 + 8.0, width: 120.0, height: 24.0)
+            self.styleLabel.layer.removeAllAnimations()
+            self.styleLabel.alpha = 1.0
+            UIView.animate(withDuration: 0.3, delay: 1.0, options: [], animations: {
+                self.styleLabel.alpha = 0.0
+            })
+            self.state?.updated(transition: .immediate)
+        }
+
         @objc private func tapped(_ gestureRecognizer: UITapGestureRecognizer) {
             guard let component = self.component else {
                 return
@@ -366,7 +469,8 @@ public final class PeerInfoGiftsCoverComponent: Component {
                 
                 let toAngle: CGFloat = .pi * 0.18
                 let centerPosition = PositionGenerator.Position(distance: 0.0, angle: iconPosition.angle + toAngle, scale: iconPosition.scale)
-                let effectivePosition = interpolatePosition(from: iconPosition, to: centerPosition, t: itemScaleFraction)
+                let spunPosition = PositionGenerator.Position(distance: iconPosition.distance, angle: iconPosition.angle + self.spinAngle, scale: iconPosition.scale)
+                let effectivePosition = interpolatePosition(from: spunPosition, to: centerPosition, t: itemScaleFraction)
                 let effectiveAngle = toAngle * itemScaleFraction
                 
                 var absolutePosition = getAbsolutePosition(position: effectivePosition, centerPoint: component.avatarCenter)
@@ -375,7 +479,7 @@ public final class PeerInfoGiftsCoverComponent: Component {
                 var resultAlpha = 1.0 - itemScaleFraction
 
                 if let islandCenter = component.islandCenter {
-                    let homePoint = getAbsolutePosition(position: iconPosition, centerPoint: component.avatarCenter)
+                    let homePoint = getAbsolutePosition(position: spunPosition, centerPoint: component.avatarCenter)
                     let dx = homePoint.x - islandCenter.x
                     let dy = homePoint.y - islandCenter.y
                     let startDistance = sqrt(dx * dx + dy * dy)
@@ -383,7 +487,7 @@ public final class PeerInfoGiftsCoverComponent: Component {
                     let fraction = itemScaleFraction
                     let pull = fraction * fraction * fraction
 
-                    switch component.hideStyle {
+                    switch GiftHideStyle.current {
                     case .blackHole:
                         // Spiral into the island while spinning: slow start, fast finish.
                         let spin: CGFloat = .pi * 1.9
@@ -461,7 +565,7 @@ public final class PeerInfoGiftsCoverComponent: Component {
 
             // Snap glove (disintegrate style only): appears next to the avatar and snaps once when gifts start to hide.
             let hideFraction = min(1.0, component.avatarTransitionFraction * 1.33)
-            if component.hideStyle == .disintegrate, component.islandCenter != nil, !self.gifts.isEmpty {
+            if GiftHideStyle.current == .disintegrate, component.islandCenter != nil, !self.gifts.isEmpty {
                 self.gloveLayer.position = CGPoint(x: component.avatarCenter.x + component.avatarSize.width * 0.5 + 58.0, y: component.avatarCenter.y + 10.0)
                 if hideFraction > 0.02 && !self.snapTriggered {
                     self.snapTriggered = true
@@ -478,15 +582,15 @@ public final class PeerInfoGiftsCoverComponent: Component {
                 self.gloveLayer.removeFromSuperlayer()
             }
 
-            if component.hideStyle != .disintegrate, !self.dustLayers.isEmpty {
+            if GiftHideStyle.current != .disintegrate, !self.dustLayers.isEmpty {
                 for (_, dust) in self.dustLayers {
                     dust.removeFromSuperlayer()
                 }
                 self.dustLayers.removeAll()
             }
 
-            if let islandCenter = component.islandCenter, !self.gifts.isEmpty, component.hideStyle != .disintegrate {
-                let intensity: CGFloat = component.hideStyle == .blackHole ? 1.0 : 0.45
+            if let islandCenter = component.islandCenter, !self.gifts.isEmpty, GiftHideStyle.current != .disintegrate {
+                let intensity: CGFloat = GiftHideStyle.current == .blackHole ? 1.0 : 0.45
                 self.blackHoleLayer.update(center: islandCenter, fraction: min(1.0, component.avatarTransitionFraction * 1.33) * intensity, transition: transition)
             } else {
                 self.blackHoleLayer.update(center: component.islandCenter ?? .zero, fraction: 0.0, transition: transition)
@@ -572,6 +676,34 @@ public enum GiftHideStyle: Int {
         }
     }
 }
+
+private let giftGlassImage: UIImage? = {
+    return generateImage(CGSize(width: 64.0, height: 64.0), rotatedContext: { size, context in
+        context.clear(CGRect(origin: .zero, size: size))
+        let rect = CGRect(origin: .zero, size: size).insetBy(dx: 2.0, dy: 2.0)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+        // body: transparent in the middle, slightly lighter toward the edge
+        var bodyLocations: [CGFloat] = [0.0, 0.7, 1.0]
+        let bodyColors: [CGColor] = [UIColor(white: 1.0, alpha: 0.04).cgColor, UIColor(white: 1.0, alpha: 0.10).cgColor, UIColor(white: 1.0, alpha: 0.30).cgColor]
+        if let gradient = CGGradient(colorsSpace: colorSpace, colors: bodyColors as CFArray, locations: &bodyLocations) {
+            context.saveGState()
+            context.addEllipse(in: rect)
+            context.clip()
+            context.drawRadialGradient(gradient, startCenter: CGPoint(x: size.width / 2.0, y: size.height / 2.0), startRadius: 0.0, endCenter: CGPoint(x: size.width / 2.0, y: size.height / 2.0), endRadius: rect.width / 2.0, options: [])
+            context.restoreGState()
+        }
+
+        // rim
+        context.setStrokeColor(UIColor(white: 1.0, alpha: 0.55).cgColor)
+        context.setLineWidth(1.5)
+        context.strokeEllipse(in: rect.insetBy(dx: 0.75, dy: 0.75))
+
+        // specular highlight, upper left
+        context.setFillColor(UIColor(white: 1.0, alpha: 0.65).cgColor)
+        context.fillEllipse(in: CGRect(x: size.width * 0.22, y: size.height * 0.16, width: size.width * 0.26, height: size.height * 0.14))
+    })
+}()
 
 private let giftDustImage: UIImage? = {
     return generateImage(CGSize(width: 6.0, height: 6.0), rotatedContext: { size, context in
@@ -923,6 +1055,7 @@ private class GiftIconLayer: SimpleLayer {
     }
     
     let shadowLayer = SimpleLayer()
+    let glassLayer = SimpleLayer()
     let starsLayer = StarsEffectLayer()
     let animationLayer: InlineStickerItemLayer
     
@@ -988,6 +1121,12 @@ private class GiftIconLayer: SimpleLayer {
         
         self.addSublayer(self.shadowLayer)
         self.addSublayer(self.starsLayer)
+
+        // Glass bubble behind the gift: faint tinted body, bright rim, soft specular highlight.
+        let glassSide = floor(size.width * 1.45)
+        self.glassLayer.frame = CGSize(width: glassSide, height: glassSide).centered(in: CGRect(origin: .zero, size: size))
+        self.glassLayer.contents = giftGlassImage?.cgImage
+        self.addSublayer(self.glassLayer)
         self.addSublayer(self.animationLayer)
     }
     
@@ -1049,6 +1188,12 @@ private class GiftIconLayer: SimpleLayer {
         
         self.addSublayer(self.shadowLayer)
         self.addSublayer(self.starsLayer)
+
+        // Glass bubble behind the gift: faint tinted body, bright rim, soft specular highlight.
+        let glassSide = floor(size.width * 1.45)
+        self.glassLayer.frame = CGSize(width: glassSide, height: glassSide).centered(in: CGRect(origin: .zero, size: size))
+        self.glassLayer.contents = giftGlassImage?.cgImage
+        self.addSublayer(self.glassLayer)
         self.addSublayer(self.animationLayer)
     }
     
